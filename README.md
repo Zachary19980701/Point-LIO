@@ -81,6 +81,8 @@ Follow [livox_ros_driver Installation](https://github.com/Livox-SDK/livox_ros_dr
 - Since the Point-LIO supports Livox serials LiDAR, so the **livox_ros_driver** must be installed and **sourced** before run any Point-LIO luanch file.
 - How to source? The easiest way is add the line ``` source $Licox_ros_driver_dir$/devel/setup.bash ``` to the end of file ``` ~/.bashrc ```, where ``` $Licox_ros_driver_dir$ ``` is the directory of the livox ros driver workspace (should be the ``` ws_livox ``` directory if you completely followed the livox official document).
 
+
+
 ## 4. Build
 Clone the repository and catkin_make:
 
@@ -161,6 +163,11 @@ Set ``` pcd_save_enable ``` in launchfile to ``` 1 ```. All the scans (in global
     3 is Y values
     4 is Z values
     5 is intensity
+```
+### 5.5 对于 RSLidar
+启动如下参数启动RSlidar的程序
+```bash
+roslaunch point_lio mapping_rslidar.launch rviz:=true
 ```
 
 # **6. Examples**

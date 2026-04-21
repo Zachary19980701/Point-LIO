@@ -1,0 +1,67 @@
+common:
+    lid_topic: "/lidar"
+    imu_topic: "/imu"
+    con_frame: false
+    con_frame_num: 1
+    cut_frame: false
+    cut_frame_time_interval: 0.1
+    time_diff_lidar_to_imu: 0.0
+
+preprocess:
+    # The new RS-LiDAR bag publishes PointCloud2 fields:
+    # x/y/z/intensity/ring/timestamp.
+    # Point-LIO's HESAIxt32 parser reads "timestamp" as absolute point time
+    # and converts it to per-point offset by subtracting msg->header.stamp.
+    lidar_type: 4
+    # In rosbag/2026-04-20-19-33-42.bag, the "ring" field exists but all valid
+    # points have ring == 0. Set scan_line to 1 for this recorded data. If your
+    # live RS-LiDAR driver later publishes real ring ids, change this to 16/32.
+    scan_line: 1
+    scan_rate: 10
+    # Not used by lidar_type 4. Kept here for compatibility with other parsers:
+    # 0: second, 1: millisecond, 2: microsecond, 3: nanosecond.
+    timestamp_unit: 0
+    blind: 2.0
+
+mapping:
+    imu_en: true
+    extrinsic_est_en: false
+    imu_time_inte: 0.005
+    lidar_time_inte: 0.1
+    satu_acc: 30.0
+    satu_gyro: 35
+    acc_norm: 9.81
+    lidar_meas_cov: 0.01
+    acc_cov_output: 500
+    gyr_cov_output: 1000
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    imu_meas_acc_cov: 0.1
+    imu_meas_omg_cov: 0.1
+    gyr_cov_input: 0.01
+    acc_cov_input: 0.1
+    plane_thr: 0.1
+    match_s: 81
+    ivox_grid_resolution: 2.0
+    gravity: [0.0, 0.0, -9.810]
+    # Not used while imu_en is true. This matches the first IMU samples in the
+    # RS-LiDAR bags and is useful if you later test imu_en false.
+    gravity_init: [0.484, 9.791, 0.366]
+    # The bags publish both /lidar and /imu with frame_id lidar_link2. Replace
+    # these with calibrated LiDAR-in-IMU extrinsics if your live setup differs.
+    extrinsic_T: [0.0, 0.0, 0.0]
+    extrinsic_R: [1, 0, 0,
+                  0, 1, 0,
+                  0, 0, 1]
+
+odometry:
+    publish_odometry_without_downsample: false
+
+publish:
+    path_en: true
+    scan_publish_en: true
+    scan_bodyframe_pub_en: false
+
+pcd_save:
+    pcd_save_en: false
+    interval: -1
