@@ -30,6 +30,11 @@ int    lidar_type, pcd_save_interval;
 std::vector<double> gravity_init, gravity;
 bool   runtime_pos_log, pcd_save_en, path_en, extrinsic_est_en = true;
 bool   scan_pub_en, scan_body_pub_en;
+bool   localization_enable = false, localization_publish_map = true, localization_wait_for_initial_pose = true;
+std::string localization_map_path, localization_init_source, localization_initial_pose_topic;
+double localization_map_voxel_size = 0.5;
+double localization_init_x = 0.0, localization_init_y = 0.0, localization_init_z = 0.0;
+double localization_init_roll = 0.0, localization_init_pitch = 0.0, localization_init_yaw = 0.0;
 shared_ptr<Preprocess> p_pre;
 shared_ptr<ImuProcess> p_imu;
 double time_update_last = 0.0, time_current = 0.0, time_predict_last_const = 0.0, t_last = 0.0;
@@ -101,10 +106,29 @@ void readParameters(ros::NodeHandle &nh)
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
 
+  nh.param<bool>("localization/enable", localization_enable, false);
+  nh.param<std::string>("localization/map_path", localization_map_path, std::string(ROOT_DIR) + "PCD/scans.pcd");
+  nh.param<double>("localization/map_voxel_size", localization_map_voxel_size, 0.5);
+  nh.param<bool>("localization/publish_map", localization_publish_map, true);
+  nh.param<std::string>("localization/init_source", localization_init_source, std::string("rviz"));
+  nh.param<std::string>("localization/initial_pose_topic", localization_initial_pose_topic, std::string("/initialpose"));
+  nh.param<bool>("localization/wait_for_initial_pose", localization_wait_for_initial_pose, true);
+  nh.param<double>("localization/init_x", localization_init_x, 0.0);
+  nh.param<double>("localization/init_y", localization_init_y, 0.0);
+  nh.param<double>("localization/init_z", localization_init_z, 0.0);
+  nh.param<double>("localization/init_roll", localization_init_roll, 0.0);
+  nh.param<double>("localization/init_pitch", localization_init_pitch, 0.0);
+  nh.param<double>("localization/init_yaw", localization_init_yaw, 0.0);
+
   nh.param<double>("mapping/lidar_time_inte",lidar_time_inte,0.1);
   nh.param<double>("mapping/lidar_meas_cov",laser_point_cov,0.1);
 
   nh.param<float>("mapping/ivox_grid_resolution", ivox_options_.resolution_, 0.2);
+  int ivox_capacity = static_cast<int>(ivox_options_.capacity_);
+  nh.param<int>("mapping/ivox_capacity", ivox_capacity, ivox_capacity);
+  if (ivox_capacity > 0) {
+    ivox_options_.capacity_ = static_cast<std::size_t>(ivox_capacity);
+  }
   nh.param<int>("ivox_nearby_type", ivox_nearby_type, 18);
   if (ivox_nearby_type == 0) {
     ivox_options_.nearby_type_ = IVoxType::NearbyType::CENTER;

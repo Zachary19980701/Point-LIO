@@ -1,10 +1,12 @@
 // #include <so3_math.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
+#include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <visualization_msgs/Marker.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <tf/transform_datatypes.h>
@@ -45,6 +47,214 @@ V3D euler_cur;
 nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
 geometry_msgs::PoseStamped msg_body_pose;
+
+PointCloudXYZI::Ptr localization_map_cloud(new PointCloudXYZI());
+std::mutex localization_pose_mutex;
+V3D localization_pending_pos(Zero3d);
+M3D localization_pending_rot(Eye3d);
+std::string localization_pending_source;
+bool localization_map_loaded = false;
+bool localization_pose_pending = false;
+bool localization_initial_pose_ready = false;
+
+M3D rotationFromRpy(double roll, double pitch, double yaw)
+{
+    Eigen::Quaterniond q =
+        Eigen::AngleAxisd(yaw, V3D::UnitZ()) *
+        Eigen::AngleAxisd(pitch, V3D::UnitY()) *
+        Eigen::AngleAxisd(roll, V3D::UnitX());
+    return q.toRotationMatrix();
+}
+
+void queueLocalizationInitialPose(
+        double x, double y, double z,
+        double roll, double pitch, double yaw,
+        const std::string &source)
+{
+    std::lock_guard<std::mutex> lock(localization_pose_mutex);
+    localization_pending_pos << x, y, z;
+    localization_pending_rot = rotationFromRpy(roll, pitch, yaw);
+    localization_pending_source = source;
+    localization_pose_pending = true;
+}
+
+void queueLocalizationParamsInitialPose(const std::string &source)
+{
+    queueLocalizationInitialPose(
+        localization_init_x, localization_init_y, localization_init_z,
+        localization_init_roll, localization_init_pitch, localization_init_yaw,
+        source);
+}
+
+void resetLocalizationInitialPoseState()
+{
+    std::lock_guard<std::mutex> lock(localization_pose_mutex);
+    localization_pose_pending = false;
+    localization_initial_pose_ready = false;
+    localization_pending_source.clear();
+}
+
+bool localizationInitialPoseReady()
+{
+    std::lock_guard<std::mutex> lock(localization_pose_mutex);
+    return localization_initial_pose_ready;
+}
+
+bool applyPendingLocalizationInitialPose()
+{
+    V3D pos;
+    M3D rot;
+    std::string source;
+    {
+        std::lock_guard<std::mutex> lock(localization_pose_mutex);
+        if (!localization_pose_pending)
+        {
+            return false;
+        }
+        pos = localization_pending_pos;
+        rot = localization_pending_rot;
+        source = localization_pending_source;
+        localization_pose_pending = false;
+        localization_initial_pose_ready = true;
+    }
+
+    kf_input.x_.pos << pos(0), pos(1), pos(2);
+    kf_input.x_.rot = rot;
+    kf_input.x_.vel << 0.0, 0.0, 0.0;
+
+    kf_output.x_.pos << pos(0), pos(1), pos(2);
+    kf_output.x_.rot = rot;
+    kf_output.x_.vel << 0.0, 0.0, 0.0;
+    kf_output.x_.omg << 0.0, 0.0, 0.0;
+
+    path.poses.clear();
+    path.header.stamp = ros::Time().fromSec(lidar_end_time);
+    path.header.frame_id = "camera_init";
+
+    ROS_INFO("Localization initial pose applied from %s: x=%.3f y=%.3f z=%.3f",
+             source.c_str(), pos(0), pos(1), pos(2));
+    return true;
+}
+
+void initialPoseHandler(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &msg)
+{
+    if (!localization_enable)
+    {
+        return;
+    }
+
+    tf::Quaternion q;
+    tf::quaternionMsgToTF(msg->pose.pose.orientation, q);
+    double unused_roll = 0.0, unused_pitch = 0.0, yaw = 0.0;
+    tf::Matrix3x3(q).getRPY(unused_roll, unused_pitch, yaw);
+
+    queueLocalizationInitialPose(
+        msg->pose.pose.position.x,
+        msg->pose.pose.position.y,
+        localization_init_z,
+        localization_init_roll,
+        localization_init_pitch,
+        yaw,
+        "rviz");
+
+    ROS_INFO("Received RViz initial pose on %s", localization_initial_pose_topic.c_str());
+}
+
+void publishLocalizationMap(const ros::Publisher &pubLaserCloudMap)
+{
+    if (!localization_publish_map || localization_map_cloud->empty())
+    {
+        return;
+    }
+
+    sensor_msgs::PointCloud2 map_msg;
+    pcl::toROSMsg(*localization_map_cloud, map_msg);
+    map_msg.header.stamp = ros::Time::now();
+    map_msg.header.frame_id = "camera_init";
+    pubLaserCloudMap.publish(map_msg);
+}
+
+bool loadLocalizationMap(const ros::Publisher &pubLaserCloudMap)
+{
+    if (!localization_enable)
+    {
+        return true;
+    }
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr raw_map(new pcl::PointCloud<pcl::PointXYZI>());
+    if (pcl::io::loadPCDFile<pcl::PointXYZI>(localization_map_path, *raw_map) < 0)
+    {
+        ROS_ERROR("Failed to load localization map PCD: %s", localization_map_path.c_str());
+        return false;
+    }
+    if (raw_map->empty())
+    {
+        ROS_ERROR("Localization map PCD is empty: %s", localization_map_path.c_str());
+        return false;
+    }
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr finite_map(new pcl::PointCloud<pcl::PointXYZI>());
+    std::vector<int> finite_indices;
+    pcl::removeNaNFromPointCloud(*raw_map, *finite_map, finite_indices);
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_xyzi(new pcl::PointCloud<pcl::PointXYZI>());
+    if (localization_map_voxel_size > 0.0)
+    {
+        pcl::VoxelGrid<pcl::PointXYZI> map_filter;
+        map_filter.setLeafSize(localization_map_voxel_size, localization_map_voxel_size, localization_map_voxel_size);
+        map_filter.setInputCloud(finite_map);
+        map_filter.filter(*filtered_xyzi);
+    }
+    else
+    {
+        *filtered_xyzi = *finite_map;
+    }
+
+    if (filtered_xyzi->empty())
+    {
+        ROS_ERROR("Localization map has no valid points after filtering: %s", localization_map_path.c_str());
+        return false;
+    }
+
+    PointCloudXYZI::Ptr filtered_map(new PointCloudXYZI());
+    filtered_map->reserve(filtered_xyzi->size());
+    for (const auto &point : filtered_xyzi->points)
+    {
+        PointType converted;
+        converted.x = point.x;
+        converted.y = point.y;
+        converted.z = point.z;
+        converted.intensity = point.intensity;
+        converted.normal_x = 0.0;
+        converted.normal_y = 0.0;
+        converted.normal_z = 0.0;
+        converted.curvature = 0.0;
+        filtered_map->push_back(converted);
+    }
+
+    if (filtered_map->size() > ivox_options_.capacity_)
+    {
+        ROS_WARN("Localization map points (%zu) exceed ivox capacity (%zu); oldest grids may be dropped.",
+                 filtered_map->size(), ivox_options_.capacity_);
+    }
+
+    PointVector map_points;
+    map_points.reserve(filtered_map->size());
+    for (const auto &point : filtered_map->points)
+    {
+        map_points.emplace_back(point);
+    }
+    ivox_->AddPoints(map_points);
+
+    localization_map_cloud = filtered_map;
+    localization_map_loaded = true;
+    init_map = true;
+
+    publishLocalizationMap(pubLaserCloudMap);
+    ROS_INFO("Loaded localization map: raw=%zu filtered=%zu ivox_grids=%zu path=%s",
+             raw_map->size(), localization_map_cloud->size(), ivox_->NumValidGrids(), localization_map_path.c_str());
+    return true;
+}
 
 void SigHandle(int sig)
 {
@@ -375,6 +585,11 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    ros::Subscriber sub_initial_pose;
+    if (localization_enable)
+    {
+        sub_initial_pose = nh.subscribe(localization_initial_pose_topic, 10, initialPoseHandler);
+    }
 
     ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 1000);
@@ -383,13 +598,29 @@ int main(int argc, char** argv)
     // ros::Publisher pubLaserCloudEffect  = nh.advertise<sensor_msgs::PointCloud2>
             // ("/cloud_effected", 1000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("/Laser_map", 1000);
+            ("/Laser_map", 1000, localization_enable && localization_publish_map);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/aft_mapped_to_init", 1000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 1000);
     // ros::Publisher plane_pub = nh.advertise<visualization_msgs::Marker>
             // ("/planner_normal", 1000);
+    if (localization_enable)
+    {
+        if (!loadLocalizationMap(pubLaserCloudMap))
+        {
+            return 1;
+        }
+        if (localization_init_source == "params" || !localization_wait_for_initial_pose)
+        {
+            queueLocalizationParamsInitialPose("params");
+        }
+        else
+        {
+            ROS_WARN("Localization map loaded. Waiting for RViz initial pose on %s",
+                     localization_initial_pose_topic.c_str());
+        }
+    }
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate loop_rate(500);
@@ -424,6 +655,24 @@ int main(int argc, char** argv)
                 
                 {
                     ivox_.reset(new IVoxType(ivox_options_));
+                }
+                if (localization_enable)
+                {
+                    resetLocalizationInitialPoseState();
+                    if (!loadLocalizationMap(pubLaserCloudMap))
+                    {
+                        flg_exit = true;
+                        break;
+                    }
+                    if (localization_init_source == "params" || !localization_wait_for_initial_pose)
+                    {
+                        queueLocalizationParamsInitialPose("params");
+                    }
+                    else
+                    {
+                        ROS_WARN("Localization reset. Waiting for RViz initial pose on %s",
+                                 localization_initial_pose_topic.c_str());
+                    }
                 }
             }
 
@@ -520,6 +769,16 @@ int main(int argc, char** argv)
                 else{
                 continue;}
             }
+            if (localization_enable)
+            {
+                applyPendingLocalizationInitialPose();
+                if (localization_wait_for_initial_pose && !localizationInitialPoseReady())
+                {
+                    ROS_WARN_THROTTLE(5.0, "Waiting for localization initial pose on %s",
+                                      localization_initial_pose_topic.c_str());
+                    continue;
+                }
+            }
             /*** initialize the map ***/
             if(!init_map)
             {
@@ -556,8 +815,8 @@ int main(int argc, char** argv)
             t2 = omp_get_wtime();
             
             /*** iterated state estimation ***/
-            crossmat_list.reserve(feats_down_size);
-            pbody_list.reserve(feats_down_size);
+            crossmat_list.resize(feats_down_size);
+            pbody_list.resize(feats_down_size);
             // pbody_ext_list.reserve(feats_down_size);
                           
             for (size_t i = 0; i < feats_down_body->size(); i++)
@@ -1010,7 +1269,7 @@ int main(int argc, char** argv)
             /*** add the feature points to map ***/
             t3 = omp_get_wtime();
             
-            if(feats_down_size > 4)
+            if(!localization_enable && feats_down_size > 4)
             {
                 MapIncremental();
             }

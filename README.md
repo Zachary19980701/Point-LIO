@@ -170,6 +170,18 @@ Set ``` pcd_save_enable ``` in launchfile to ``` 1 ```. All the scans (in global
 roslaunch point_lio mapping_rslidar.launch rviz:=true
 ```
 
+### 5.6 RSLidar PCD纯定位模式
+先用建图模式保存好 `Point-LIO/PCD/scans.pcd`，再启动纯定位模式：
+```bash
+roslaunch point_lio localization_rslidar.launch map_path:=/home/robot/point_lio_ws/src/Point-LIO/PCD/scans.pcd rviz:=true
+```
+该模式会把已有PCD加载到 `/Laser_map`，并等待RViz的 `2D Pose Estimate`（`/initialpose`）作为初始位姿。RViz的 Fixed Frame 请设置为 `camera_init`。收到初始位姿后，节点只进行 LiDAR+IMU 到静态地图的匹配定位，不再把当前帧追加进地图。
+
+如果已知初始位姿，也可以不用RViz，直接通过launch参数给出：
+```bash
+roslaunch point_lio localization_rslidar.launch init_source:=params wait_for_initial_pose:=false init_x:=0 init_y:=0 init_z:=0 init_yaw:=0
+```
+
 # **6. Examples**
 
 The example datasets could be downloaded through [onedrive](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/hdj65822_connect_hku_hk/EmRJYy4ZfAlMiIJ786ogCPoBcGQ2BAchuXjE5oJQjrQu0Q?e=igu44W). Pay attention that if you want to test on racing_drone.bag, [0.0, 9.810, 0.0] should be input in 'mapping/gravity_init' in avia.yaml, and set the 'start_in_aggressive_motion' as true in the yaml. Because this bag start from a high speed motion. And for PULSAR.bag, we change the measuring range of the gyroscope of the built-in IMU to 17.5 rad/s. Therefore, when you test on this bag, please change 'satu_gyro' to 17.5 in avia.yaml.
