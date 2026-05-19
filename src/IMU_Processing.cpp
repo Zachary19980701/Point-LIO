@@ -14,6 +14,11 @@
  */
 const bool time_list(PointType &x, PointType &y) {return (x.curvature < y.curvature);};
 
+
+/**
+* @brief 设置陀螺仪和加速度计的协方差
+*/
+
 void ImuProcess::set_gyr_cov(const V3D &scaler)
 {
   cov_gyr_scale = scaler;

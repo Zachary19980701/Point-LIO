@@ -1,3 +1,13 @@
+/**
+ * @file li_initialization.cpp
+ * @brief 数据的预处理和同步模块
+ * 文件函数说明：
+ * standard_pcl_cbk： 标准的pcd2消息的回调函数，处理雷达点云数据，支持分块、合并和普通的点云处理
+ * livox_pcl_cbk： 处理livox_ros_driver2::CustomMsg消息的回调函数，处理雷达点云数据，支持分块、合并和普通的点云处理
+ * imu_cbk： 处理imu消息的回调函数，处理IMU数据并
+ * sync_packages： 同步imu和lidar数据，保证每次处理的数据都是时间上对齐的，返回是否成功同步
+ */
+
 #include "li_initialization.h"
 bool data_accum_finished = false, data_accum_start = false, online_calib_finish = false, refine_print = false;
 int frame_num_init = 0;
@@ -22,11 +32,16 @@ std::deque<PointCloudXYZI::Ptr>  lidar_buffer;
 std::deque<double>               time_buffer;
 std::deque<sensor_msgs::Imu::Ptr> imu_deque;
 
+/**
+    @brief 处理标准pcd2消息的回调函数
+*/
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
 {
     // mtx_buffer.lock();
-    scan_count ++;
-    double preprocess_start_time = omp_get_wtime();
+    scan_count ++; //更新scan的计数器
+    double preprocess_start_time = omp_get_wtime(); // 获取当前的时间，用于处理预处理的时间
+
+    // 判断雷达的时间戳是否回退，回退返回错误信息
     if (msg->header.stamp.toSec() < last_timestamp_lidar)
     {
         ROS_ERROR("lidar loop back, clear buffer");
@@ -37,7 +52,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
         return;
     }
 
-    last_timestamp_lidar = msg->header.stamp.toSec();
+    last_timestamp_lidar = msg->header.stamp.toSec(); // 更新lidar的时间戳
     // printf("check lidar time %f\n", last_timestamp_lidar);
     // if (abs(last_timestamp_imu - last_timestamp_lidar) > 1.0 && !timediff_set_flg && !imu_deque.empty()) {
     //     timediff_set_flg = true;
@@ -45,7 +60,8 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     //     printf("Self sync IMU and LiDAR, HARD time lag is %.10lf \n \n", timediff_imu_wrt_lidar);
     // }
 
-    if ((lidar_type == VELO16 || lidar_type == OUST64 || lidar_type == HESAIxt32) && cut_frame_init) {
+    // 根据不同的雷达类型和是否使用切帧关键词选择进行雷达点云的切帧
+    if ((lidar_type == VELO16 || lidar_type == OUST64 || lidar_type == HESAIxt32 || lidar_type == LIVOX_POINTCLOUD2) && cut_frame_init) {
         deque<PointCloudXYZI::Ptr> ptr;
         deque<double> timestamp_lidar;
         p_pre->process_cut_frame_pcl2(msg, ptr, timestamp_lidar, cut_frame_num, scan_count);
@@ -60,8 +76,9 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     {
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI(20000,1));
     p_pre->process(msg, ptr);
-    if (con_frame)
-    {
+    if (con_frame)   // 合帧处理
+    {   
+        // 合帧处理逻辑，能够增加随机扫描的点云稠密度
         if (frame_ct == 0)
         {
             time_con = last_timestamp_lidar; //msg->header.stamp.toSec();
@@ -87,7 +104,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
             frame_ct = 0;
         }
     }
-    else
+    else // 普通模式进行处理
     { 
         if (ptr->points.size() > 0)
         {
@@ -101,6 +118,10 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
     // sig_buffer.notify_all();
 }
 
+
+/**
+    @brief 处理livox_ros_driver2::CustomMsg消息的回调函数
+*/
 void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg) 
 {
     // mtx_buffer.lock();
@@ -180,6 +201,10 @@ void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
     // sig_buffer.notify_all();
 }
 
+
+/**
+    @brief 处理imu消息的回调函数
+*/
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
 {
     // mtx_buffer.lock();
@@ -209,6 +234,9 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     // sig_buffer.notify_all();
 }
 
+/**
+    @brief 同步imu和lidar数据，保证每次处理的数据都是时间上对齐的
+*/
 bool sync_packages(MeasureGroup &meas)
 {
     {

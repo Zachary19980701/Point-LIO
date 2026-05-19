@@ -81,12 +81,16 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     velodyne_handler(msg);
     break;
   
-  case HESAIxt32:
-    hesai_handler(msg);
-    break;
-  
-  default:
-    printf("Error LiDAR Type");
+	  case HESAIxt32:
+	    hesai_handler(msg);
+	    break;
+
+	  case LIVOX_POINTCLOUD2:
+	    livox_pointcloud2_handler(msg);
+	    break;
+	  
+	  default:
+	    printf("Error LiDAR Type");
     break;
   }
   *pcl_out = pl_surf;
@@ -163,6 +167,24 @@ Preprocess::process_cut_frame_pcl2(const sensor_msgs::PointCloud2::ConstPtr &msg
     pl_surf.clear();
     pl_corn.clear();
     pl_full.clear();
+    switch (time_unit)
+    {
+      case SEC:
+        time_unit_scale = 1.e3f;
+        break;
+      case MS:
+        time_unit_scale = 1.f;
+        break;
+      case US:
+        time_unit_scale = 1.e-3f;
+        break;
+      case NS:
+        time_unit_scale = 1.e-6f;
+        break;
+      default:
+        time_unit_scale = 1.f;
+        break;
+    }
     if (lidar_type == VELO16) {
         pcl::PointCloud<velodyne_ros::Point> pl_orig;
         pcl::fromROSMsg(*msg, pl_orig);
@@ -272,6 +294,32 @@ Preprocess::process_cut_frame_pcl2(const sensor_msgs::PointCloud2::ConstPtr &msg
                 continue;
 
             if (i % point_filter_num == 0 && pl_orig.points[i].ring < N_SCANS) {
+                pl_surf.points.push_back(added_pt);
+            }
+        }
+    } else if(lidar_type == LIVOX_POINTCLOUD2) {
+        pcl::PointCloud<livox_ros2::Point> pl_orig;
+        pcl::fromROSMsg(*msg, pl_orig);
+        int plsize = pl_orig.points.size();
+        if (plsize == 0) return;
+        pl_surf.reserve(plsize);
+        double time_head = pl_orig.points[0].timestamp;
+        for (int i = 0; i < plsize; i++) {
+            PointType added_pt;
+            added_pt.normal_x = 0;
+            added_pt.normal_y = 0;
+            added_pt.normal_z = 0;
+            added_pt.x = pl_orig.points[i].x;
+            added_pt.y = pl_orig.points[i].y;
+            added_pt.z = pl_orig.points[i].z;
+            added_pt.intensity = pl_orig.points[i].intensity;
+            added_pt.curvature = (pl_orig.points[i].timestamp - time_head) * time_unit_scale;
+
+            double dist = added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z;
+            if ( dist < blind * blind || dist > det_range * det_range || isnan(added_pt.x) || isnan(added_pt.y) || isnan(added_pt.z))
+                continue;
+
+            if (i % point_filter_num == 0 && pl_orig.points[i].line < N_SCANS) {
                 pl_surf.points.push_back(added_pt);
             }
         }
@@ -602,6 +650,45 @@ void Preprocess::hesai_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
       }
     }
     
+}
+
+void Preprocess::livox_pointcloud2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+    pl_surf.clear();
+    pl_corn.clear();
+    pl_full.clear();
+
+    pcl::PointCloud<livox_ros2::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    int plsize = pl_orig.points.size();
+    if (plsize == 0) return;
+    pl_surf.reserve(plsize);
+
+    double time_head = pl_orig.points[0].timestamp;
+
+    for (int i = 0; i < plsize; i++)
+    {
+      PointType added_pt;
+      added_pt.normal_x = 0;
+      added_pt.normal_y = 0;
+      added_pt.normal_z = 0;
+      added_pt.x = pl_orig.points[i].x;
+      added_pt.y = pl_orig.points[i].y;
+      added_pt.z = pl_orig.points[i].z;
+      added_pt.intensity = pl_orig.points[i].intensity;
+      // Livox driver2 PointCloud2 的 timestamp 是每点绝对时间，这里转成相对帧头时间，单位 ms。
+      added_pt.curvature = (pl_orig.points[i].timestamp - time_head) * time_unit_scale;
+
+      if (i % point_filter_num == 0 && !std::isnan(added_pt.x) && !std::isnan(added_pt.y) && !std::isnan(added_pt.z))
+      {
+        if (pl_orig.points[i].line < N_SCANS
+        && added_pt.x*added_pt.x+added_pt.y*added_pt.y+added_pt.z*added_pt.z > (blind * blind)
+        && added_pt.x*added_pt.x+added_pt.y*added_pt.y+added_pt.z*added_pt.z < (det_range * det_range))
+        {
+          pl_surf.points.push_back(added_pt);
+        }
+      }
+    }
 }
 
 void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &types)

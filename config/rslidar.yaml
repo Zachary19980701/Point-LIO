@@ -8,20 +8,14 @@ common:
     time_diff_lidar_to_imu: 0.0
 
 preprocess:
-    # The new RS-LiDAR bag publishes PointCloud2 fields:
-    # x/y/z/intensity/ring/timestamp.
-    # Point-LIO's HESAIxt32 parser reads "timestamp" as absolute point time
-    # and converts it to per-point offset by subtracting msg->header.stamp.
-    lidar_type: 4
-    # In rosbag/2026-04-20-19-33-42.bag, the "ring" field exists but all valid
-    # points have ring == 0. Set scan_line to 1 for this recorded data. If your
-    # live RS-LiDAR driver later publishes real ring ids, change this to 16/32.
-    scan_line: 1
+    # Livox driver2 PointCloud2 fields:
+    # x/y/z/intensity/tag/line/timestamp.
+    lidar_type: 5
+    scan_line: 4
     scan_rate: 10
-    # Not used by lidar_type 4. Kept here for compatibility with other parsers:
     # 0: second, 1: millisecond, 2: microsecond, 3: nanosecond.
-    timestamp_unit: 0
-    blind: 2.0
+    timestamp_unit: 3
+    blind: 0.5
 
 mapping:
     imu_en: true
