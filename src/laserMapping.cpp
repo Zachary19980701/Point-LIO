@@ -1103,11 +1103,13 @@ int main(int argc, char** argv)
             // =============================================================
             t1 = omp_get_wtime();
 
-            // p_imu->Process() 执行:
-            //   - 反向传播: 利用 IMU 积分对每个点进行运动畸变校正
-            //   - 将点转换到 scan 结束时刻的 Body 坐标系
-            //   - 输出: feats_undistort (畸变校正后的点云)
-            p_imu->Process(Measures, feats_undistort);
+            // p_imu->Process() 实际功能:
+            //   - IMU 未初始化时: 累积 IMU 数据估计重力方向 (IMU_init), 不返回点云
+            //   - IMU 初始化后: 仅将原始 LiDAR 点云从 meas.lidar 拷贝到 feats_undistort
+            //   注意: 这里没有做运动畸变校正! "feats_undistort" 名字有误导性。
+            //   真正的去畸变效果由后续逐点 IESKF 在每个点的精确时间戳上
+            //   进行状态传播+投影来隐式完成 (point-by-point update)
+            p_imu->Process(Measures, feats_undistort); //保证点云在IMU初始化完成之后才可以使用
 
             if(space_down_sample)
             {
@@ -1174,6 +1176,7 @@ int main(int argc, char** argv)
 
             // =============================================================
             // 6e6. 地图初始化 — 累积足够的初始帧后建立地图
+            // 这里只做一个单纯的点的积累，没有太多的
             // =============================================================
             if(!init_map)
             {
@@ -1214,6 +1217,17 @@ int main(int argc, char** argv)
             //   - 分配 nearest points 容器
             //   - 预计算每个点的 Body 系坐标和叉乘矩阵 (用于雅可比)
             // =============================================================
+
+            // =============================================================
+            // IESKF 迭代的预先计算工作
+            // 这里包含四个容器：pbody_list crossmat_list normvec Nearest_Points
+            // - pbody_list: 存储每个点在 Body (IMU) 系下的坐标
+            // - crossmat_list: 存储每个点对应的叉乘矩阵 (用于旋转雅可比计算)
+            // - normvec: 存储每个点的平面法向量和距离
+            // - Nearest_Points: 存储每个点在世界系下的最近邻点集合 (用于平面拟合)
+            // =============================================================
+            
+            // 初始化四个四个容器，并且将容器的大小放到 feats_down_size一样的大小。
             normvec->resize(feats_down_size);
             feats_down_world->resize(feats_down_size);
             Nearest_Points.resize(feats_down_size);
@@ -1255,14 +1269,23 @@ int main(int argc, char** argv)
             //            - 迭代求解状态增量
             //         5. 将处理后的点投影到世界系
             // =============================================================
-            if (!use_imu_as_input)
+
+            // 模式二：IMU 作为输出 (kf_output, 30 维)
+            // Estimator.cpp:168 — 状态微分不由 IMU 驱动
+            // Eigen::Matrix<double, 30, 1> get_f_output(state_output &s, const input_ikfom &in)
+            // {
+            // a_inertial = s.rot * s.acc;          // ← 用状态里的 acc, 不用 IMU 测量!
+            // res(速度) = a_inertial + s.gravity;
+            // in 参数完全不参与计算
+            // }
+            if (!use_imu_as_input) // 与论文中的算法符合，也就是将IMU的数据作为观测而不是输入
             {
                 bool imu_upda_cov = false;
                 effct_feat_num = 0;
 
                 if (time_seq.size() > 0)
                 {
-                double pcl_beg_time = Measures.lidar_beg_time;
+                double pcl_beg_time = Measures.lidar_beg_time; // 更新开始时间
                 idx = -1;
                 for (k = 0; k < time_seq.size(); k++)
                 {
@@ -1295,14 +1318,14 @@ int main(int argc, char** argv)
                     if(imu_en && !imu_deque.empty())
                     {
                         bool last_imu = imu_next.header.stamp.toSec() == imu_deque.front()->header.stamp.toSec();
-                        // 丢弃过时的 IMU (时间在 predict 基准之前)
+                        // 丢弃过时的 IMU (时间在 predict 基准之前)保证 predict 的时间基准总是位于 IMU 测量之后
                         while (imu_next.header.stamp.toSec() < time_predict_last_const && !imu_deque.empty())
                         {
                             if (!last_imu)
                             {
                                 imu_last = imu_next;
-                                imu_next = *(imu_deque.front());
-                                break;
+                                imu_next = *(imu_deque.front()); // 防止空队列访问
+                                break; 
                             }
                             else
                             {
@@ -1313,25 +1336,27 @@ int main(int argc, char** argv)
                             }
                         }
                         // 消费位于当前点时间之前的 IMU 测量, 进行协方差传播+IMU更新
-                        bool imu_comes = time_current > imu_next.header.stamp.toSec();
-                        while (imu_comes)
+                        bool imu_comes = time_current > imu_next.header.stamp.toSec(); // 下一帧的IMU的数据
+                        while (imu_comes) // 如果有下一帧的IMU数据，更新ESKF的协方差和状态
                         {
                             imu_upda_cov = true;
+                            // 将IMU的角速度和加速度赋值
                             angvel_avr<<imu_next.angular_velocity.x, imu_next.angular_velocity.y, imu_next.angular_velocity.z;
                             acc_avr   <<imu_next.linear_acceleration.x, imu_next.linear_acceleration.y, imu_next.linear_acceleration.z;
 
                             // 协方差传播 (仅更新协方差, 不更新状态)
-                            double dt = imu_next.header.stamp.toSec() - time_predict_last_const;
+                            double dt = imu_next.header.stamp.toSec() - time_predict_last_const; // 计算间隔时间dt
+                            // 这里做分开的更新，短时间内只更新状态，在长的时间步内则更新状态和协方差。节省计算时间。
                             kf_output.predict(dt, Q_output, input_in, true, false);
-                            time_predict_last_const = imu_next.header.stamp.toSec();
+                            time_predict_last_const = imu_next.header.stamp.toSec(); // 更新时间步
 
                             {
                                 double dt_cov = imu_next.header.stamp.toSec() - time_update_last;
-                                if (dt_cov > 0.0)
+                                if (dt_cov > 0.0) // 这里主要是避免反复的更新跨帧的时间步
                                 {
                                     time_update_last = imu_next.header.stamp.toSec();
                                     double propag_imu_start = omp_get_wtime();
-                                    kf_output.predict(dt_cov, Q_output, input_in, false, true);
+                                    kf_output.predict(dt_cov, Q_output, input_in, false, true); // 更新协方差
                                     propag_time += omp_get_wtime() - propag_imu_start;
 
                                     double solve_imu_start = omp_get_wtime();
@@ -1349,7 +1374,7 @@ int main(int argc, char** argv)
                     if (flg_reset) { break; }
 
                     // --- 状态前向传播到当前点的时间 ---
-                    double dt = time_current - time_predict_last_const;
+                    double dt = time_current - time_predict_last_const; //将lidar点之前的 IMU点数据都更新到距离雷达点最近的时间点上
                     double propag_state_start = omp_get_wtime();
                     if(!prop_at_freq_of_imu)
                     {
@@ -1372,7 +1397,7 @@ int main(int argc, char** argv)
                         idx += time_seq[k];
                         continue;
                     }
-                    if (!kf_output.update_iterated_dyn_share_modified())
+                    if (!kf_output.update_iterated_dyn_share_modified()) // 使用当前批次的雷达对kf_output进行更新修正
                     {
                         idx = idx+time_seq[k];
                         continue;  // 迭代不收敛, 跳过当前批次
