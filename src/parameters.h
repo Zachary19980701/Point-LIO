@@ -53,6 +53,9 @@ extern float  DET_RANGE;
 extern bool   imu_en;
 extern double imu_time_inte;
 extern double laser_point_cov, acc_norm;
+extern bool   patch_matching_en;           // Patch ICP matching for area-array LiDAR
+extern double patch_cov_scale;             // Measurement noise scale for patch mode
+extern double patch_eigenvalue_thr;        // Eigenvalue threshold for ICP compression rank
 extern double acc_cov_input, gyr_cov_input, vel_cov;
 extern double gyr_cov_output, acc_cov_output, b_gyr_cov, b_acc_cov;
 extern double imu_meas_acc_cov, imu_meas_omg_cov; 

@@ -22,6 +22,9 @@ mapping:
     satu_gyro: 35 # the saturation value of IMU's angular velocity. not related to the units
     acc_norm: 1.0 # 1.0 for g as unit, 9.81 for m/s^2 as unit of the IMU's acceleration
     lidar_meas_cov: 0.01 # 0.001
+    patch_matching_en: false        # Enable patch-level ICP matching for area-array LiDAR
+    patch_cov_scale: 1.0            # Measurement noise scale for patch mode
+    patch_eigenvalue_thr: 0.01      # Eigenvalue threshold for ICP compression rank
     acc_cov_output: 500
     gyr_cov_output: 1000 
     b_acc_cov: 0.0001 

@@ -26,6 +26,11 @@ int effct_feat_num = 0;  // 有效特征点数量
 int k = 0;  // 时间序列索引
 int idx = -1;  // 点云索引
 
+// Patch ICP matching parameters
+bool   patch_matching_en = false;
+double patch_cov_scale = 1.0;
+double patch_eigenvalue_thr = 0.01;
+
 // 两个卡尔曼滤波器实例:
 // kf_input: 输入模式,状态向量24维 (论文Section III-B)
 // kf_output: 输出模式,状态向量30维 (论文Section III-B)
@@ -265,6 +270,12 @@ Eigen::Matrix<double, 30, 30> df_dx_output(state_output &s, const input_ikfom &i
  */
 void h_model_input(state_input &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R, esekfom::dyn_share_modified<double> &ekfom_data)
 {
+	if (patch_matching_en && time_seq[k] > 1)
+	{
+		h_model_input_patch(s, cov_p, cov_R, ekfom_data);
+		return;
+	}
+
 	bool match_in_map = false;
 	VF(4) pabcd;  // 平面参数 [A, B, C, D]
 	pabcd.setZero();
@@ -392,8 +403,157 @@ void h_model_input(state_input &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R,
 	effct_feat_num += effect_num_k;
 }
 
+/**
+ * @brief Patch ICP measurement model (input mode)
+ *
+ * Treats a patch (time_seq[k] points with shared timestamp) as a local ICP problem.
+ * Builds the normal equations A*dx = -b from N point-to-plane constraints,
+ * compresses via eigendecomposition to retain the effective rank r.
+ *
+ * Output: h_x (r x 12), z (r x 1) -- r << N, preserving all effective information.
+ */
+void h_model_input_patch(state_input &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R, esekfom::dyn_share_modified<double> &ekfom_data)
+{
+	VF(4) pabcd;
+	int group_size = time_seq[k];
+	int global_start = idx + 1;
+
+	// ===== Pass 1: Per-point KNN + plane fitting (identical to existing logic) =====
+	normvec->resize(group_size);
+	int effect_num_k = 0;
+	for (int j = 0; j < group_size; j++)
+	{
+		PointType &point_body_j  = feats_down_body->points[global_start + j];
+		PointType &point_world_j = feats_down_world->points[global_start + j];
+		pointBodyToWorld(&point_body_j, &point_world_j);
+
+		V3D p_body = pbody_list[global_start + j];
+		double p_norm = p_body.norm();
+		V3D p_world;
+		p_world << point_world_j.x, point_world_j.y, point_world_j.z;
+
+		{
+			auto &points_near = Nearest_Points[global_start + j];
+			ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
+
+			point_selected_surf[global_start + j] = false;
+			if (points_near.size() < NUM_MATCH_POINTS) continue;
+
+			pabcd.setZero();
+			if (!esti_plane(pabcd, points_near, plane_thr)) continue;
+
+			float pd2 = fabs(pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y
+			               + pabcd(2) * point_world_j.z + pabcd(3));
+			if (p_norm <= match_s * pd2 * pd2) continue;
+
+			point_selected_surf[global_start + j] = true;
+			normvec->points[j].x = pabcd(0);
+			normvec->points[j].y = pabcd(1);
+			normvec->points[j].z = pabcd(2);
+			normvec->points[j].intensity = pabcd(3);
+			effect_num_k++;
+		}
+	}
+
+	if (effect_num_k == 0)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	// ===== Pass 2: Build normal equations A(12x12), b(12x1) =====
+	Eigen::Matrix<double, 12, 12> A = Eigen::Matrix<double, 12, 12>::Zero();
+	Eigen::Matrix<double, 12, 1>  b = Eigen::Matrix<double, 12, 1>::Zero();
+
+	for (int j = 0; j < group_size; j++)
+	{
+		if (!point_selected_surf[global_start + j]) continue;
+
+		V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
+		V3D p_body = pbody_list[global_start + j];
+
+		Eigen::Matrix<double, 1, 12> H_j;
+
+		if (extrinsic_est_en)
+		{
+			M3D p_crossmat, p_imu_crossmat;
+			p_crossmat << SKEW_SYM_MATRX(p_body);
+			V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
+			p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
+			V3D C(s.rot.transpose() * norm_vec);
+			V3D A_j(p_imu_crossmat * C);
+			V3D B_j(p_crossmat * s.offset_R_L_I.transpose() * C);
+			H_j << norm_vec(0), norm_vec(1), norm_vec(2),
+			       VEC_FROM_ARRAY(A_j), VEC_FROM_ARRAY(B_j), VEC_FROM_ARRAY(C);
+		}
+		else
+		{
+			M3D point_crossmat = crossmat_list[global_start + j];
+			V3D C(s.rot.transpose() * norm_vec);
+			V3D A_j(point_crossmat * C);
+			H_j << norm_vec(0), norm_vec(1), norm_vec(2),
+			       VEC_FROM_ARRAY(A_j), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+		}
+
+		double z_j = -(norm_vec(0) * feats_down_world->points[global_start + j].x
+		             + norm_vec(1) * feats_down_world->points[global_start + j].y
+		             + norm_vec(2) * feats_down_world->points[global_start + j].z
+		             + normvec->points[j].intensity);
+
+		A += H_j.transpose() * H_j;
+		b += H_j.transpose() * z_j;
+	}
+
+	// ===== Pass 3: Eigendecomposition + compression to effective rank =====
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 12, 12>> eig(A);
+	if (eig.info() != Eigen::Success)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	const auto &D = eig.eigenvalues();   // sorted ascending
+	const auto &V = eig.eigenvectors();  // column i = eigenvector for D(i)
+
+	// Count eigenvalues > threshold * max eigenvalue (from largest to smallest)
+	double max_ev = D(11);
+	int r = 0;
+	for (int i = 11; i >= 0; i--)
+	{
+		if (D(i) > patch_eigenvalue_thr * max_ev) r++;
+		else break;
+	}
+
+	if (r == 0)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	// Build compressed measurement: H_icp (r x 12), z_icp (r x 1)
+	ekfom_data.h_x.resize(r, 12);
+	ekfom_data.z.resize(r);
+
+	for (int i = 0; i < r; i++)
+	{
+		int idx_ev = 11 - i;  // from largest to smallest
+		double sqrt_lambda = sqrt(D(idx_ev));
+		ekfom_data.h_x.row(i) = sqrt_lambda * V.col(idx_ev).transpose();
+		ekfom_data.z(i) = V.col(idx_ev).dot(b) / sqrt_lambda;
+	}
+
+	ekfom_data.M_Noise = laser_point_cov * patch_cov_scale;
+	effct_feat_num += 1;
+}
+
 void h_model_output(state_output &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R, esekfom::dyn_share_modified<double> &ekfom_data)
 {
+	if (patch_matching_en && time_seq[k] > 1)
+	{
+		h_model_output_patch(s, cov_p, cov_R, ekfom_data);
+		return;
+	}
+
 	bool match_in_map = false;
 	VF(4) pabcd;
 	pabcd.setZero();
@@ -496,6 +656,144 @@ void h_model_output(state_output &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_
 		}
 	}
 	effct_feat_num += effect_num_k;
+}
+
+/**
+ * @brief Patch ICP measurement model (output mode)
+ *
+ * Same as h_model_input_patch but uses state_output.
+ * Treats a patch as a local ICP problem, builds normal equations A*dx = -b,
+ * compresses via eigendecomposition to retain effective rank r.
+ */
+void h_model_output_patch(state_output &s, Eigen::Matrix3d cov_p, Eigen::Matrix3d cov_R, esekfom::dyn_share_modified<double> &ekfom_data)
+{
+	VF(4) pabcd;
+	int group_size = time_seq[k];
+	int global_start = idx + 1;
+
+	// ===== Pass 1: Per-point KNN + plane fitting =====
+	normvec->resize(group_size);
+	int effect_num_k = 0;
+	for (int j = 0; j < group_size; j++)
+	{
+		PointType &point_body_j  = feats_down_body->points[global_start + j];
+		PointType &point_world_j = feats_down_world->points[global_start + j];
+		pointBodyToWorld(&point_body_j, &point_world_j);
+
+		V3D p_body = pbody_list[global_start + j];
+		double p_norm = p_body.norm();
+		V3D p_world;
+		p_world << point_world_j.x, point_world_j.y, point_world_j.z;
+
+		{
+			auto &points_near = Nearest_Points[global_start + j];
+			ivox_->GetClosestPoint(point_world_j, points_near, NUM_MATCH_POINTS);
+
+			point_selected_surf[global_start + j] = false;
+			if (points_near.size() < NUM_MATCH_POINTS) continue;
+
+			pabcd.setZero();
+			if (!esti_plane(pabcd, points_near, plane_thr)) continue;
+
+			float pd2 = fabs(pabcd(0) * point_world_j.x + pabcd(1) * point_world_j.y
+			               + pabcd(2) * point_world_j.z + pabcd(3));
+			if (p_norm <= match_s * pd2 * pd2) continue;
+
+			point_selected_surf[global_start + j] = true;
+			normvec->points[j].x = pabcd(0);
+			normvec->points[j].y = pabcd(1);
+			normvec->points[j].z = pabcd(2);
+			normvec->points[j].intensity = pabcd(3);
+			effect_num_k++;
+		}
+	}
+
+	if (effect_num_k == 0)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	// ===== Pass 2: Build normal equations A(12x12), b(12x1) =====
+	Eigen::Matrix<double, 12, 12> A = Eigen::Matrix<double, 12, 12>::Zero();
+	Eigen::Matrix<double, 12, 1>  b = Eigen::Matrix<double, 12, 1>::Zero();
+
+	for (int j = 0; j < group_size; j++)
+	{
+		if (!point_selected_surf[global_start + j]) continue;
+
+		V3D norm_vec(normvec->points[j].x, normvec->points[j].y, normvec->points[j].z);
+		V3D p_body = pbody_list[global_start + j];
+
+		Eigen::Matrix<double, 1, 12> H_j;
+
+		if (extrinsic_est_en)
+		{
+			M3D p_crossmat, p_imu_crossmat;
+			p_crossmat << SKEW_SYM_MATRX(p_body);
+			V3D point_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
+			p_imu_crossmat << SKEW_SYM_MATRX(point_imu);
+			V3D C(s.rot.transpose() * norm_vec);
+			V3D A_j(p_imu_crossmat * C);
+			V3D B_j(p_crossmat * s.offset_R_L_I.transpose() * C);
+			H_j << norm_vec(0), norm_vec(1), norm_vec(2),
+			       VEC_FROM_ARRAY(A_j), VEC_FROM_ARRAY(B_j), VEC_FROM_ARRAY(C);
+		}
+		else
+		{
+			M3D point_crossmat = crossmat_list[global_start + j];
+			V3D C(s.rot.transpose() * norm_vec);
+			V3D A_j(point_crossmat * C);
+			H_j << norm_vec(0), norm_vec(1), norm_vec(2),
+			       VEC_FROM_ARRAY(A_j), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
+		}
+
+		double z_j = -(norm_vec(0) * feats_down_world->points[global_start + j].x
+		             + norm_vec(1) * feats_down_world->points[global_start + j].y
+		             + norm_vec(2) * feats_down_world->points[global_start + j].z
+		             + normvec->points[j].intensity);
+
+		A += H_j.transpose() * H_j;
+		b += H_j.transpose() * z_j;
+	}
+
+	// ===== Pass 3: Eigendecomposition + compression =====
+	Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 12, 12>> eig(A);
+	if (eig.info() != Eigen::Success)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	const auto &D = eig.eigenvalues();
+	const auto &V = eig.eigenvectors();
+	double max_ev = D(11);
+	int r = 0;
+	for (int i = 11; i >= 0; i--)
+	{
+		if (D(i) > patch_eigenvalue_thr * max_ev) r++;
+		else break;
+	}
+
+	if (r == 0)
+	{
+		ekfom_data.valid = false;
+		return;
+	}
+
+	ekfom_data.h_x.resize(r, 12);
+	ekfom_data.z.resize(r);
+
+	for (int i = 0; i < r; i++)
+	{
+		int idx_ev = 11 - i;
+		double sqrt_lambda = sqrt(D(idx_ev));
+		ekfom_data.h_x.row(i) = sqrt_lambda * V.col(idx_ev).transpose();
+		ekfom_data.z(i) = V.col(idx_ev).dot(b) / sqrt_lambda;
+	}
+
+	ekfom_data.M_Noise = laser_point_cov * patch_cov_scale;
+	effct_feat_num += 1;
 }
 
 void h_model_IMU_output(state_output &s, esekfom::dyn_share_modified<double> &ekfom_data)

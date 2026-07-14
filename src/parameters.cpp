@@ -79,6 +79,9 @@ void readParameters(ros::NodeHandle &nh)
   nh.param<bool>("mapping/extrinsic_est_en",extrinsic_est_en,true);
   nh.param<double>("mapping/imu_time_inte",imu_time_inte,0.005);
   nh.param<double>("mapping/lidar_meas_cov",laser_point_cov,0.1);
+  nh.param<bool>("mapping/patch_matching_en", patch_matching_en, false);
+  nh.param<double>("mapping/patch_cov_scale", patch_cov_scale, 1.0);
+  nh.param<double>("mapping/patch_eigenvalue_thr", patch_eigenvalue_thr, 0.01);
   nh.param<double>("mapping/acc_cov_input",acc_cov_input,0.1);
   nh.param<double>("mapping/vel_cov",vel_cov,20);
   nh.param<double>("mapping/gyr_cov_input",gyr_cov_input,0.1);
