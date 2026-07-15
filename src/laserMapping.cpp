@@ -723,6 +723,51 @@ void publish_frame_body(const ros::Publisher & pubLaserCloudFull_body)
 }
 
 /**
+ * @brief 发布完整的 iVox 全局地图
+ *
+ * 从内部 iVox 体素哈希栅格中提取所有点并发布到 /Laser_map。
+ * 通过 map_pub_interval 做帧率限制（默认每 50 帧发布一次），
+ * 避免对大尺寸地图高频发布导致性能问题。
+ *
+ * 跳过条件:
+ * - map_pub_en = false
+ * - 未达到 map_pub_interval 帧间隔
+ * - iVox 地图为空
+ *
+ * @param pubLaserCloudMap /Laser_map 话题的 ROS publisher
+ */
+void publish_full_map(const ros::Publisher &pubLaserCloudMap)
+{
+    if (!map_pub_en) return;
+
+    static int frame_counter = 0;
+    frame_counter++;
+    if (frame_counter % map_pub_interval != 0) return;
+
+    // 从 iVox 提取全部点
+    PointVector all_points;
+    ivox_->GetAllPoints(all_points);
+
+    if (all_points.empty()) return;
+
+    // 转换为 PCL 点云后构造 ROS 消息
+    pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
+    cloud->points = std::move(all_points);
+    cloud->width = cloud->points.size();
+    cloud->height = 1;
+
+    sensor_msgs::PointCloud2 laser_cloud_msg;
+    pcl::toROSMsg(*cloud, laser_cloud_msg);
+    laser_cloud_msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laser_cloud_msg.header.frame_id = "camera_init";
+
+    pubLaserCloudMap.publish(laser_cloud_msg);
+
+    ROS_INFO("Published full iVox map: %zu points from %zu grids",
+             cloud->size(), ivox_->NumValidGrids());
+}
+
+/**
  * @brief 将当前卡尔曼滤波器状态写入 ROS Pose 消息 (模板函数)
  *
  * 根据 use_imu_as_input 标志选择读取 kf_output 或 kf_input 的状态。
@@ -1111,7 +1156,10 @@ int main(int argc, char** argv)
             //   进行状态传播+投影来隐式完成 (point-by-point update)
             p_imu->Process(Measures, feats_undistort); //保证点云在IMU初始化完成之后才可以使用
 
-            if(space_down_sample)
+            // A global VoxelGrid may average curvature and mix different firing
+            // instants. Keep the raw points when a timestamp patch is the atomic
+            // ICP unit, otherwise the original 8-point grouping can be destroyed.
+            if(space_down_sample && !(patch_matching_en && patch_preserve_points))
             {
                 // 空间体素降采样 (filter_size_surf_min 体素大小)
                 downSizeFilterSurf.setInputCloud(feats_undistort);
@@ -1723,6 +1771,7 @@ int main(int argc, char** argv)
             if (path_en)                         publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFullRes);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFullRes_body);
+            if (!localization_enable && init_map) publish_full_map(pubLaserCloudMap);
 
             // =============================================================
             // 6e12. 性能日志 — 移动平均统计各阶段耗时

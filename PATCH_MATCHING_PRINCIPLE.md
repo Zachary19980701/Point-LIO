@@ -1,235 +1,146 @@
-# Point-LIO 面阵雷达 Patch ICP 匹配原理文档
+# Point-LIO 非共面同步 Patch ICP
 
-## 1. 问题
+## 1. 适用数据
 
-面阵雷达的 patch 内 N 个点共享时间戳和传感器位姿。现有逐点匹配将 N 个点作为 N 个独立测量，patch 区域被过度加权 N 倍。
+该模式面向一次曝光同时输出一组点的面阵雷达。工程使用
+`curvature` 保存点相对时间，`time_compressing()` 将时间戳完全相同的点组成
+一个 patch。一个 patch 内的点共享同一个雷达位姿，但不要求：
 
-**目标**：把 patch 作为一个子点云，和地图做 ICP 匹配，输出 1 个等效测量。
+- 位于同一个平面；
+- 命中同一个物体；
+- 具有相同法向量。
 
-## 2. 原理：法方程压缩
+只要地图对应正确，不同表面的点仍然服从同一个刚体变换。
 
-### 2.1 从 N 个约束到 1 个 ICP 解
+## 2. 新匹配流程
 
-每个点贡献一个点到平面约束：
+启用 `mapping/patch_matching_en` 后，点数达到 `patch_icp_min_inliers` 的时间组
+走以下流程；更小的时间组自动回退到原逐点点面模型：
 
-```
-点 j:    r_j = n_j^T * p_world_j + d_j ≈ 0
-线性化:  r_j + H_j * δx ≈ 0    (H_j: 1×12 行向量)
-```
-
-N 个点构成一个局部最小二乘问题：
-
-```
-min  Σ (H_j * δx + z_j)²
-δx
-```
-
-其法方程为：
-
-```
-A * δx = -b
-
-其中:  A = Σ H_j^T * H_j    (12×12)
-       b = Σ H_j^T * z_j    (12×1)
+```text
+同步点组
+  → 使用当前 ESKF 状态投影到世界系
+  → 每个点从 iVox 查询 1 个最近点
+  → Huber 加权
+  → 对整组对应执行一次共享的 SVD 刚体对齐
+  → 更新临时 patch 并重复 1~3 次
+  → 重新查询最终对应
+  → patch 级内点数、RMSE、位移和旋转门限
+  → 构造三维点到点联合测量
+  → 信息矩阵特征压缩
+  → 一次 ESKF 更新
 ```
 
-直接解 `δx = -A^(-1) * b` 就是 Gauss-Newton 步长（即 ICP 的一次迭代修正量）。
+局部 ICP 只改变临时 patch，用于改善对应关系；不会直接修改滤波状态。最终状态
+增量仍由 ESKF 根据先验协方差和 LiDAR 测量共同计算。
 
-### 2.2 信息压缩
+## 3. 点到点测量
 
-但 A 通常是秩亏的。对于平面上的点到平面约束：
+对 patch 中第 (j) 个点：
 
-```
-A 的秩 r ≤ 3（1 个法向平移 + 2 个旋转）
-```
+[
+p_j^w = R(R_{LI}p_j^L+t_{LI})+t
+]
 
-只有跨越多个不同方向的平面时，r 才能达到 6。
+iVox 最近点为 (q_j^w)，测量残差为：
 
-做特征分解只保留有效维度：
+[
+z_j=q_j^w-p_j^w
+]
 
-```
-A = V * D * V^T
+每个对应提供三维约束。固定外参时雅可比为：
 
-D = diag(λ_1, ..., λ_12),  λ_1 ≥ λ_2 ≥ ... ≥ λ_12
+[
+H_j=[I,;-R[p_j^I]_\times,;0,;0]
+]
 
-保留: λ_i > eigenvalue_thr 的 r 个维度
-```
+估计外参时增加：
 
-构造压缩测量：
+[
+H_{R_{LI}}=-RR_{LI}[p_j^L]_\times,qquad H_{t_{LI}}=R
+]
 
-```
-D_r = diag(λ_1, ..., λ_r)              (r×r)
-V_r = [v_1, ..., v_r]                  (12×r)
+Huber 权重为 (w_j)，联合信息为：
 
-H_icp = sqrt(D_r) * V_r^T             (r×12)
-z_icp = D_r^(-1/2) * V_r^T * b        (r×1)
-R_icp = σ² * I_r                       (r×r)
-```
+[
+A=\sum_j w_jH_j^TH_j,qquad b=\sum_jw_jH_j^Tz_j
+]
 
-这个 `(H_icp, z_icp, R_icp)` 在信息论意义上与原 N 个约束等价：
+随后对 (A) 特征分解并输出压缩测量。这一步只删除低信息方向，不再进行
+任何平面拟合。
 
-```
-H_icp^T * R_icp^(-1) * H_icp = A / σ²   ← 同样的信息矩阵
-H_icp^T * R_icp^(-1) * z_icp = b / σ²   ← 同样的梯度
-```
+## 4. Patch 级拒绝条件
 
-### 2.3 为什么这等价于局部 ICP
+满足任一条件时整块测量无效：
 
-Gauss-Newton ICP 的一次迭代：
+- 有效对应少于 `patch_icp_min_inliers`；
+- 最近点距离超过 `patch_icp_max_corr_dist`；
+- 最终 RMSE 超过 `patch_icp_max_rmse`；
+- 临时 ICP 平均位移超过局部搜索范围；
+- 临时 ICP 旋转超过 0.35 rad；
+- patch 空间分布退化成近似一条直线；
+- 信息矩阵没有可保留的特征方向。
 
-```
-δx = -(J^T * J)^(-1) * J^T * r
-   = -A^(-1) * b
-```
+这避免少量错误点单独把滤波状态拉向错误地图位置。
 
-其中 J 是 N 个点到平面距离的 Jacobian，r 是残差。在 IESKF 中，这个修正量通过 Kalman 更新融入，而非直接应用——IESKF 会结合先验协方差 P 做加权：
+## 5. 时间组保护
 
-```
-dx = P * H_icp^T * (H_icp * P * H_icp^T + R_icp)^(-1) * z_icp
-```
-
-这和直接应用 δx 不同——IESKF 在 ICP 修正和先验之间做了最优权衡。
-
-## 3. 方案对比
-
-| 维度 | 逐点 (现有) | 平均合并 | ICP 压缩 (本方案) |
-|------|-----------|---------|-------------------|
-| 第一遍 (KNN+平面) | N 次 | N 次 | N 次 |
-| 第二遍 | N 行 H, N 个 z | avg → 1 行 | A,b → 特征分解 → r 行 |
-| 输出维度 | N | 1 | **r (1~6, 自动)** |
-| 秩自动检测 | 否 | 否 | **是** |
-| 信息丢失 | 无 (但过量) | 有 (假设共线) | **无** |
-| 统计正确 | ❌ N倍过量 | ⚠️ | **✅** |
-| IESKF 求逆 | (N×N)⁻¹ | 标量 | **(r×r)⁻¹** |
-| 单平面退化为 | N 行 | 1 行 | **自动退化到 r≤3** |
-
-## 4. 数据流
-
-```
-LiDAR frame
-  → curvature = 时间戳
-  → sort + time_compressing → time_seq
-  → 预计算: pbody_list, crossmat_list
-
-IESKF 主循环 (不变):
-  for k in time_seq:
-      
-      IMU 传播到 time_current
-      
-      if patch_matching_en && time_seq[k] > 1:
-          ┌──────────────────────────────────────────┐
-          │ h_model_*_patch():                       │
-          │                                          │
-          │ ① 逐点匹配 (与现有完全相同):              │
-          │    for j in [0, N):                      │
-          │        变换 → KNN → esti_plane → 验证     │
-          │        → H_j(1×12), z_j(标量)             │
-          │                                          │
-          │ ② 构建法方程:                             │
-          │    A = Σ H_j^T * H_j   (12×12)           │
-          │    b = Σ H_j^T * z_j   (12×1)            │
-          │                                          │
-          │ ③ 特征分解 + 压缩:                        │
-          │    A = V*D*V^T                           │
-          │    保留 λ_i > thr 的 r 个维度              │
-          │    H_icp = sqrt(D_r)*V_r^T (r×12)        │
-          │    z_icp = D_r^(-1/2)*V_r^T*b (r×1)      │
-          │                                          │
-          │ 输出: h_x(r×12), z(r×1), R=σ²*I_r       │
-          └──────────────────────────────────────────┘
-      else:
-          逐点匹配 (现有逻辑)
-      
-      IESKF ← K = P*H^T*(H*P*H^T+R)^(-1)
-      dx = K*z, x = x ⊞ dx
-      
-      投影点到世界系 → MapIncremental
-```
-
-## 5. 关键代码结构
-
-```cpp
-void h_model_input_patch(state_input &s, ..., ekfom_data)
-{
-    int N = time_seq[k];
-    int start = idx + 1;
-
-    // ===== ① 逐点 KNN + 平面拟合 (与现有完全相同) =====
-    normvec->resize(N);
-    for (int j = 0; j < N; j++) {
-        pointBodyToWorld(...);
-        ivox_->GetClosestPoint(...);
-        if (esti_plane(...) && valid) {
-            normvec->points[j] = ...;   // 保存地图平面参数
-            point_selected_surf[start+j] = true;
-        }
-    }
-
-    // ===== ② 构建法方程 A(12×12), b(12×1) =====
-    Eigen::Matrix<double, 12, 12> A = Eigen::Matrix<double, 12, 12>::Zero();
-    Eigen::Matrix<double, 12, 1>  b = Eigen::Matrix<double, 12, 1>::Zero();
-    int valid_count = 0;
-
-    for (int j = 0; j < N; j++) {
-        if (!point_selected_surf[start+j]) continue;
-
-        // 计算 H_j (1×12) — 与现有代码完全相同
-        Eigen::Matrix<double, 1, 12> H_j;
-        V3D norm_vec(...从 normvec[j] 取得...);
-        V3D p_body = pbody_list[start+j];
-        
-        // H_j 的前3列: n^T
-        // H_j 的第4-6列: n^T * R * [p_imu]×  (旋转部分)
-        // ... Jacobian 计算与现有完全一致 ...
-
-        double z_j = -(n_i^T * p_world_i + d_i);
-
-        A += H_j.transpose() * H_j;
-        b += H_j.transpose() * z_j;
-        valid_count++;
-    }
-
-    if (valid_count == 0) { ekfom_data.valid = false; return; }
-
-    // ===== ③ 特征分解 + 压缩 =====
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 12, 12>> eig(A);
-    auto &D = eig.eigenvalues();   // 12 个特征值 (升序)
-    auto &V = eig.eigenvectors();  // 12×12 特征向量
-
-    // 统计特征值 > threshold 的个数 (从大到小)
-    int r = 0;
-    for (int i = 11; i >= 0; i--) {  // 从大到小
-        if (D(i) > patch_eigenvalue_thr * D(11)) r++;
-        else break;
-    }
-
-    // 构造 H_icp (r×12), z_icp (r×1)
-    ekfom_data.h_x.resize(r, 12);
-    ekfom_data.z.resize(r);
-
-    for (int i = 0; i < r; i++) {
-        double sqrt_lambda = sqrt(D(11 - i));  // 从大到小取
-        ekfom_data.h_x.row(i) = sqrt_lambda * V.col(11 - i).transpose();
-        ekfom_data.z(i) = V.col(11 - i).dot(b) / sqrt_lambda;
-    }
-
-    ekfom_data.M_Noise = laser_point_cov * patch_cov_scale;
-    effct_feat_num += 1;
-}
-```
-
-## 6. 配置参数
+普通 PCL VoxelGrid 可能对 `PointXYZINormal::curvature` 求平均，使不同曝光时刻
+产生虚假的平均时间戳。默认：
 
 ```yaml
-patch_matching_en: false         # 启用 patch ICP 匹配
-patch_cov_scale: 1.0             # 测量噪声缩放
-patch_eigenvalue_thr: 0.01       # 特征值阈值 (相对最大特征值的比例)
-                                 # 控制有效秩: 仅 λ_i/λ_max > thr 被保留
+patch_preserve_points: true
 ```
 
-## 7. 为什么这个方案正确
+启用 patch 匹配后会跳过扫描内的全局体素降采样，从而保留原始同步点组。地图仍由
+iVox 管理。若上游已经提供显式 patch ID 并实现了 patch-aware 降采样，可以关闭该
+选项。
 
-1. **信息无损**：法方程 A 包含了 N 个约束的全部有效信息，特征分解只丢弃了噪声维度的分量
-2. **自动降秩**：对于平面约束（rank ≤ 3），自动只保留 1~3 维；对于丰富几何（跨越多平面），自动保留更多维度
-3. **IESKF 友好**：输出为标准 `(H, z, R)` 格式，后端无需任何修改
-4. **退化处理**：当 patch 在退化几何上（如长走廊），A 的秩更小，自动调整测量维度
+## 6. 参数
+
+```yaml
+mapping:
+  patch_matching_en: true
+  patch_cov_scale: 1.0
+  patch_eigenvalue_thr: 0.01
+  patch_icp_max_iterations: 3
+  patch_icp_min_inliers: 3
+  patch_icp_max_corr_dist: 1.0
+  patch_icp_huber_delta: 0.20
+  patch_icp_max_rmse: 0.30
+  patch_preserve_points: true
+```
+
+参数含义：
+
+- `patch_cov_scale`：点到点残差协方差缩放；漂移或震荡时优先增大。
+- `patch_eigenvalue_thr`：相对最大特征值的信息方向截止比例。
+- `patch_icp_max_iterations`：局部对应细化次数；8 点 patch 建议 2~3。
+- `patch_icp_min_inliers`：最少有效对应数；8 点 patch 建议 3~5。
+- `patch_icp_max_corr_dist`：初始状态允许的局部匹配半径。
+- `patch_icp_huber_delta`：超过此残差后逐渐降低对应权重。
+- `patch_icp_max_rmse`：最终 patch 一致性门限。
+- `patch_preserve_points`：保护原始同步点组。
+
+仓库中的通用雷达配置仍默认关闭 `patch_matching_en`，避免旋转扫描雷达被误当成
+同步面阵雷达。面阵雷达使用的 YAML 必须显式设为 `true`。
+
+## 7. 调参建议与限制
+
+建议从以下组合开始：
+
+```yaml
+patch_icp_max_iterations: 2
+patch_icp_min_inliers: 4
+patch_icp_max_corr_dist: 0.5
+patch_icp_huber_delta: 0.10
+patch_icp_max_rmse: 0.15
+patch_cov_scale: 2.0
+```
+
+再根据地图分辨率和初始位姿误差放宽距离门限。
+
+点到点 ICP 不依赖平面，但会受到地图采样密度影响：在大面积平滑表面上，离散地图点
+可能产生不真实的切向约束。因此建议提高 `patch_cov_scale`，并通过真实数据比较
+patch RMSE、轨迹抖动和闭环误差。若后续需要进一步提高平滑表面的精度，可在不要求
+patch 共面的前提下，为每个对应加入局部协方差，升级为 Generalized ICP。

@@ -111,8 +111,8 @@ Visualization Manager:
           Class: rviz/PointCloud2
           Color: 255; 255; 255
           Color Transformer: Intensity
-          Decay Time: 1000
-          Enabled: true
+          Decay Time: 0
+          Enabled: false
           Invert Rainbow: true
           Max Color: 255; 255; 255
           Min Color: 0; 0; 0
@@ -272,22 +272,22 @@ Visualization Manager:
       Color: 138; 226; 52
       Color Transformer: FlatColor
       Decay Time: 0
-      Enabled: false
+      Enabled: true
       Invert Rainbow: false
       Max Color: 138; 226; 52
       Min Color: 138; 226; 52
-      Name: PointCloud2
+      Name: Full Map
       Position Transformer: XYZ
       Queue Size: 10
       Selectable: true
       Size (Pixels): 3
-      Size (m): 0.10000000149011612
-      Style: Flat Squares
+      Size (m): 0.05000000074505806
+      Style: Points
       Topic: /Laser_map
       Unreliable: false
       Use Fixed Frame: true
       Use rainbow: true
-      Value: false
+      Value: true
     - Class: rviz/MarkerArray
       Enabled: false
       Marker Topic: /MarkerArray

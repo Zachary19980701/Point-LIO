@@ -26,9 +26,15 @@ mapping:
     satu_gyro: 35
     acc_norm: 9.81
     lidar_meas_cov: 0.01
-    patch_matching_en: false        # Enable patch-level ICP matching for area-array LiDAR
-    patch_cov_scale: 1.0            # Measurement noise scale for patch mode
-    patch_eigenvalue_thr: 0.01      # Eigenvalue threshold for ICP compression rank
+    patch_matching_en: true        # Enable joint patch-to-map ICP
+    patch_cov_scale: 1.0            # Point-to-point residual covariance scale
+    patch_eigenvalue_thr: 0.01      # Relative information eigenvalue cutoff
+    patch_icp_max_iterations: 3
+    patch_icp_min_inliers: 3
+    patch_icp_max_corr_dist: 1.0
+    patch_icp_huber_delta: 0.20
+    patch_icp_max_rmse: 0.30
+    patch_preserve_points: true
     acc_cov_output: 500
     gyr_cov_output: 1000
     b_acc_cov: 0.0001
@@ -58,6 +64,8 @@ publish:
     path_en: true
     scan_publish_en: true
     scan_bodyframe_pub_en: false
+    map_pub_en: true                # 周期性发布全地图
+    map_pub_interval: 50            # 每 N 帧发布一次全地图
 
 pcd_save:
     pcd_save_en: false

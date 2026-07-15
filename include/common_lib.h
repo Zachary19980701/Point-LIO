@@ -236,7 +236,7 @@ bool esti_normvector(Matrix<T, 3, 1> &normvec, const PointVector &point, const T
 }
 
 /**
- * @brief 平面拟合函数 - 使用最小二乘法拟合局部平面
+ * @brief 平面拟合函数 - 使用最小二乘法拟合局部平面 逐点的拟合平面
  *
  * 对应论文Section III-C: 点到平面距离测量模型
  *

@@ -128,6 +128,9 @@ class IVox {
     /// 获取点云统计信息
     std::vector<float> StatGridPoints() const;
 
+    /// 获取 iVox 地图中所有点
+    void GetAllPoints(PointVector& points) const;
+
     // ==================== 公开成员变量 ====================
     // 哈希表: 体素索引 -> 体素节点迭代器
     std::unordered_map<KeyType, typename std::list<std::pair<KeyType, NodeType>>::iterator, hash_vec<dim>>
@@ -270,6 +273,15 @@ bool IVox<dim, node_type, PointType>::GetClosestPoint(const PointType& pt, Point
 template <int dim, IVoxNodeType node_type, typename PointType>
 size_t IVox<dim, node_type, PointType>::NumValidGrids() const {
     return grids_map_.size();
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
+size_t IVox<dim, node_type, PointType>::NumPoints() const {
+    size_t total = 0;
+    for (const auto& cache_entry : grids_cache_) {
+        total += cache_entry.second.Size();
+    }
+    return total;
 }
 
 /**
@@ -429,6 +441,19 @@ std::vector<float> IVox<dim, node_type, PointType>::StatGridPoints() const {
     float stddev = num > 1 ? sqrt((float(sum_square) - num * ave * ave) / (num - 1)) : 0;
 
     return std::vector<float>{valid_num, ave, max, min, stddev};
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
+void IVox<dim, node_type, PointType>::GetAllPoints(PointVector& points) const {
+    points.clear();
+    points.reserve(this->NumPoints());
+    for (const auto& cache_entry : grids_cache_) {
+        const NodeType& node = cache_entry.second;
+        const size_t node_size = node.Size();
+        for (size_t i = 0; i < node_size; ++i) {
+            points.emplace_back(node.GetPoint(i));
+        }
+    }
 }
 
 }  // namespace faster_lio
