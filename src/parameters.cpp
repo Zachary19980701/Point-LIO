@@ -30,6 +30,8 @@ int    lidar_type, pcd_save_interval;
 std::vector<double> gravity_init, gravity;
 bool   runtime_pos_log, pcd_save_en, path_en, extrinsic_est_en = true;
 bool   scan_pub_en, scan_body_pub_en;
+bool   map_pub_en = true;
+double map_pub_interval = 1.0;
 bool   localization_enable = false, localization_publish_map = true, localization_wait_for_initial_pose = true;
 std::string localization_map_path, localization_init_source, localization_initial_pose_topic;
 double localization_map_voxel_size = 0.5;
@@ -102,6 +104,8 @@ void readParameters(ros::NodeHandle &nh)
   nh.param<bool>("publish/path_en",path_en, true);
   nh.param<bool>("publish/scan_publish_en",scan_pub_en,1);
   nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en,1);
+  nh.param<bool>("publish/map_publish_en", map_pub_en, true);
+  nh.param<double>("publish/map_publish_interval", map_pub_interval, 1.0);
   nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);

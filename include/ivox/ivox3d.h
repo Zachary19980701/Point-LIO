@@ -122,6 +122,9 @@ class IVox {
     /// 获取地图中的总点数
     size_t NumPoints() const;
 
+    /// 导出当前 iVox 内部实际保存的全部地图点
+    void GetAllPoints(PointVector& points) const;
+
     /// 获取有效体素网格数量
     size_t NumValidGrids() const;
 
@@ -270,6 +273,27 @@ bool IVox<dim, node_type, PointType>::GetClosestPoint(const PointType& pt, Point
 template <int dim, IVoxNodeType node_type, typename PointType>
 size_t IVox<dim, node_type, PointType>::NumValidGrids() const {
     return grids_map_.size();
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
+size_t IVox<dim, node_type, PointType>::NumPoints() const {
+    size_t num_points = 0;
+    for (const auto& grid : grids_cache_) {
+        num_points += grid.second.Size();
+    }
+    return num_points;
+}
+
+template <int dim, IVoxNodeType node_type, typename PointType>
+void IVox<dim, node_type, PointType>::GetAllPoints(PointVector& points) const {
+    points.clear();
+    points.reserve(NumPoints());
+    for (const auto& grid : grids_cache_) {
+        const NodeType& node = grid.second;
+        for (size_t i = 0; i < node.Size(); ++i) {
+            points.emplace_back(node.GetPoint(i));
+        }
+    }
 }
 
 /**

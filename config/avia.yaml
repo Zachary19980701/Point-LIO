@@ -47,6 +47,8 @@ publish:
     path_en: true                 # false: close the path output
     scan_publish_en: true         # false: close all the point cloud output
     scan_bodyframe_pub_en: false  # true: output the point cloud scans in IMU-body-frame
+    map_publish_en: true          # publish the current internal iVox map on /Laser_map
+    map_publish_interval: 1.0     # seconds; <= 0 publishes after every processed scan
 
 pcd_save:
     pcd_save_en: false

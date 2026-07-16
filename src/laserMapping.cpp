@@ -114,6 +114,7 @@ std::string localization_pending_source;                            ///< 位姿�
 bool localization_map_loaded = false;                                ///< 地图是否已加载
 bool localization_pose_pending = false;                              ///< 是否有待应用位姿
 bool localization_initial_pose_ready = false;                        ///< 初始位姿是否就绪
+ros::WallTime last_ivox_map_publish_time;                            ///< iVox 地图上次发布时间
 
 
 //=====================================================================
@@ -318,6 +319,50 @@ void publishLocalizationMap(const ros::Publisher &pubLaserCloudMap)
 }
 
 /**
+ * @brief 将 Point-LIO 当前 iVox 内部地图发布到 /Laser_map
+ *
+ * 发布的是 iVox 容器中当前实际保留的全部点，因此会反映增量更新
+ * 以及容量超限时的 LRU 淘汰结果。完整地图转换成 PointCloud2 开销较大，
+ * 所以通过 publish/map_publish_interval 限制发布频率。
+ */
+void publishIVoxMap(const ros::Publisher &pubLaserCloudMap, bool force = false)
+{
+    const bool publish_enabled = localization_enable ? localization_publish_map : map_pub_en;
+    if (!publish_enabled || !ivox_ || (localization_enable && !force))
+    {
+        return;
+    }
+
+    const ros::WallTime now = ros::WallTime::now();
+    if (!force && map_pub_interval > 0.0 && !last_ivox_map_publish_time.isZero() &&
+        (now - last_ivox_map_publish_time).toSec() < map_pub_interval)
+    {
+        return;
+    }
+
+    PointVector map_points;
+    ivox_->GetAllPoints(map_points);
+    if (map_points.empty())
+    {
+        return;
+    }
+
+    PointCloudXYZI map_cloud;
+    map_cloud.points.assign(map_points.begin(), map_points.end());
+    map_cloud.width = static_cast<uint32_t>(map_cloud.points.size());
+    map_cloud.height = 1;
+    map_cloud.is_dense = true;
+
+    sensor_msgs::PointCloud2 map_msg;
+    pcl::toROSMsg(map_cloud, map_msg);
+    map_msg.header.stamp = lidar_end_time > 0.0 ? ros::Time().fromSec(lidar_end_time) : ros::Time::now();
+    map_msg.header.frame_id = "camera_init";
+    pubLaserCloudMap.publish(map_msg);
+    last_ivox_map_publish_time = now;
+}
+
+
+/**
  * @brief 加载重定位模式使用的预构建 PCD 地图
  *
  * === 完整的数据处理流水线 ===
@@ -416,7 +461,7 @@ bool loadLocalizationMap(const ros::Publisher &pubLaserCloudMap)
     localization_map_loaded = true;
     init_map = true;  // 跳过建图初始化阶段
 
-    publishLocalizationMap(pubLaserCloudMap);
+    publishIVoxMap(pubLaserCloudMap, true);
     ROS_INFO("Loaded localization map: raw=%zu filtered=%zu ivox_grids=%zu path=%s",
              raw_map->size(), localization_map_cloud->size(), ivox_->NumValidGrids(), localization_map_path.c_str());
     return true;
@@ -944,7 +989,7 @@ int main(int argc, char** argv)
     // ros::Publisher pubLaserCloudEffect  = nh.advertise<sensor_msgs::PointCloud2>
             // ("/cloud_effected", 1000);
     ros::Publisher pubLaserCloudMap = nh.advertise<sensor_msgs::PointCloud2>
-            ("/Laser_map", 1000, localization_enable && localization_publish_map);  ///< 地图点云
+            ("/Laser_map", 1, true);               ///< iVox 内部地图点云（latched）
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry>
             ("/aft_mapped_to_init", 1000);        ///< 里程计位姿
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path>
@@ -1202,7 +1247,7 @@ int main(int argc, char** argv)
                 {
                     // 将累积的点插入 iVox 地图，完成初始化
                     ivox_->AddPoints(init_feats_world->points);
-                    publish_init_map(pubLaserCloudMap);
+                    publishIVoxMap(pubLaserCloudMap, true);
 
                     init_feats_world.reset(new PointCloudXYZI());  // 释放内存
                     init_map = true;
@@ -1714,6 +1759,8 @@ int main(int argc, char** argv)
             {
                 MapIncremental();
             }
+
+            publishIVoxMap(pubLaserCloudMap);
 
             t5 = omp_get_wtime();
 
